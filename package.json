@@ -1,0 +1,41 @@
+{
+  "name": "dual-skeleton",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Browser-side hand and body landmark recognition base built on MediaPipe Tasks Vision.",
+  "author": "Alaric2006",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Alaric2006/DualSkeleton.git"
+  },
+  "homepage": "https://github.com/Alaric2006/DualSkeleton#readme",
+  "bugs": {
+    "url": "https://github.com/Alaric2006/DualSkeleton/issues"
+  },
+  "keywords": [
+    "mediapipe",
+    "hand-tracking",
+    "hand-landmarks",
+    "pose-estimation",
+    "computer-vision",
+    "typescript",
+    "vite",
+    "canvas"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "0.10.14"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "vite": "^7.0.0"
+  }
+}

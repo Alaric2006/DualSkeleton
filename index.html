@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DualSkeleton · 浏览器端手部 + 全身双识别底座</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0a0c10;
+        --panel: #12161d;
+        --line: #232a34;
+        --text: #e6e9ee;
+        --muted: #8b94a3;
+        --accent: #4ade80;
+        --danger: #f87171;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--text);
+        font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .brand {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        font-size: 14px;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+      }
+
+      .brand span {
+        font-size: 12px;
+        font-weight: 400;
+        letter-spacing: 0.04em;
+        color: var(--muted);
+      }
+
+      .status {
+        font-size: 12px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .status[data-state="running"] {
+        color: var(--accent);
+      }
+
+      .status[data-state="error"] {
+        color: var(--danger);
+      }
+
+      .app {
+        display: flex;
+        align-items: flex-start;
+        gap: 16px;
+        padding: 16px;
+        flex-wrap: wrap;
+      }
+
+      .stage {
+        position: relative;
+        flex: 1 1 640px;
+        min-width: 300px;
+        min-height: 240px;
+        background: #000;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        overflow: hidden;
+      }
+
+      /*
+       * 层级方案：video 放在 .stage 的第一个子节点、保持正常文档流，
+       * 由它撑出 .stage 的真实宽高比；两块 canvas 绝对定位铺满同一块区域，
+       * 因为排在 video 之后，绘制顺序天然位于 video 之上，无需 z-index。
+       */
+      .stage > video {
+        display: block;
+        width: 100%;
+        height: auto;
+        background: #000;
+      }
+
+      /*
+       * 两块 canvas 共用这一条规则：完全重叠、由 .stage 的盒子统一约束。
+       * 各自不写任何定位/尺寸，避免两层尺寸漂移。
+       */
+      .stage > canvas {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+      }
+
+      .side {
+        flex: 0 0 340px;
+        max-width: 100%;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .toggles {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px;
+        padding: 10px 14px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        font-size: 13px;
+        color: #cfd6e0;
+      }
+
+      .toggles label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        cursor: pointer;
+      }
+
+      .toggles input {
+        accent-color: var(--accent);
+      }
+
+      .notice {
+        padding: 10px 14px;
+        background: #2a2113;
+        border: 1px solid #5a4a1f;
+        border-radius: 14px;
+        color: #f3d08a;
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      .notice[hidden] {
+        display: none;
+      }
+
+      .panel {
+        width: 100%;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 12px 14px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      .panel-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding-bottom: 10px;
+        margin-bottom: 10px;
+        border-bottom: 1px solid var(--line);
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        color: var(--muted);
+      }
+
+      .panel-status {
+        letter-spacing: 0;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .panel-body {
+        margin: 0;
+        font-size: 12px;
+        line-height: 1.65;
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: #cfd6e0;
+      }
+
+      .error {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        padding: 28px;
+        text-align: center;
+        background: rgba(10, 12, 16, 0.94);
+      }
+
+      .error h2 {
+        margin: 0;
+        font-size: 16px;
+        color: var(--danger);
+      }
+
+      .error p {
+        margin: 0;
+        max-width: 46ch;
+        font-size: 13px;
+        line-height: 1.7;
+        color: var(--muted);
+      }
+
+      .hidden {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">DUALSKELETON <span>浏览器端手部 + 全身双识别底座</span></div>
+      <div id="status" class="status">初始化中…</div>
+    </header>
+
+    <main class="app">
+      <section class="stage">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="poseOverlay"></canvas>
+        <canvas id="handOverlay"></canvas>
+        <div id="error" class="error hidden" role="alert">
+          <h2 id="errorTitle">无法启动</h2>
+          <p id="errorDetail"></p>
+        </div>
+      </section>
+
+      <aside class="side">
+        <div class="toggles">
+          <label><input type="checkbox" id="toggleHands" checked /> 手部骨架</label>
+          <label><input type="checkbox" id="togglePose" checked /> 全身骨架</label>
+        </div>
+        <div id="notice" class="notice" hidden></div>
+        <aside id="panel" class="panel"></aside>
+      </aside>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
