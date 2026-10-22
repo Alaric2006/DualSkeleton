@@ -30,14 +30,12 @@ export type TrackerBackend = "GPU" | "CPU";
 const WASM_DIR = `${import.meta.env.BASE_URL}mediapipe/wasm`;
 const MODEL_URL = `${import.meta.env.BASE_URL}models/hand_landmarker.task`;
 
-/** 无 SIMD 版 wasm：SIMD 版在部分 WebKit 上会卡死在初始化，这里作为兼容档重试。 */
-const NOSIMD_FILESET = {
-  wasmLoaderPath: `${WASM_DIR}/vision_wasm_nosimd_internal.js`,
-  wasmBinaryPath: `${WASM_DIR}/vision_wasm_nosimd_internal.wasm`,
-};
-
-/** 单次 createFromOptions 的最长等待时间；超时即视为该档不可用。 */
-const CREATE_TIMEOUT_MS = 20000;
+/**
+ * 单次 createFromOptions 的最长等待时间。
+ * iOS 上首次编译 9.4MB wasm 可能要十几到几十秒，20s 会误判为失败；
+ * 第一次编译完成后浏览器会复用已编译模块，后续同档创建通常在 1 秒内完成。
+ */
+const CREATE_TIMEOUT_MS = 60000;
 
 /**
  * iOS / iPadOS 的 WebKit（Safari、微信等内置浏览器同源）在创建 GPU delegate 时
@@ -127,7 +125,8 @@ export class HandTracker {
     }> = IS_APPLE_MOBILE
       ? [
           { label: "CPU", fileset: simdFileset, delegate: "CPU" },
-          { label: "CPU 兼容档（无 SIMD）", fileset: NOSIMD_FILESET, delegate: "CPU" },
+          // 首次 wasm 编译超时后，模块通常已经编译完成；同档重试会在 1 秒内返回。
+          { label: "CPU 重试", fileset: simdFileset, delegate: "CPU" },
         ]
       : [
           { label: "GPU", fileset: simdFileset, delegate: "GPU" },
@@ -136,7 +135,13 @@ export class HandTracker {
 
     let lastError: unknown = null;
     for (const attempt of attempts) {
+      const startedAt = performance.now();
       onStage?.(`初始化手部推理引擎（${attempt.label}）…`);
+      // 每秒刷新已等待时长，方便在手机上判断是“还在编译”还是“已经死了”。
+      const ticker = setInterval(() => {
+        const seconds = Math.round((performance.now() - startedAt) / 1000);
+        onStage?.(`初始化手部推理引擎（${attempt.label}）… ${seconds}s`);
+      }, 1000);
       try {
         const landmarker = await withTimeout(
           this.create(attempt.fileset, attempt.delegate, modelBuffer),
@@ -151,6 +156,8 @@ export class HandTracker {
       } catch (error) {
         lastError = error;
         console.warn(`[handTracker] ${attempt.label} 初始化失败，尝试下一档。`, error);
+      } finally {
+        clearInterval(ticker);
       }
     }
 

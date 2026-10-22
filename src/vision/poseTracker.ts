@@ -40,14 +40,11 @@ const POSE_TRACKER_CONFIG = {
 const WASM_DIR = `${import.meta.env.BASE_URL}mediapipe/wasm`;
 const MODEL_URL = `${import.meta.env.BASE_URL}models/pose_landmarker_lite.task`;
 
-/** 无 SIMD 版 wasm：SIMD 版在部分 WebKit 上会卡死在初始化，这里作为兼容档重试。 */
-const NOSIMD_FILESET = {
-  wasmLoaderPath: `${WASM_DIR}/vision_wasm_nosimd_internal.js`,
-  wasmBinaryPath: `${WASM_DIR}/vision_wasm_nosimd_internal.wasm`,
-};
-
-/** 单次 createFromOptions 的最长等待时间；超时即视为该档不可用。 */
-const CREATE_TIMEOUT_MS = 20000;
+/**
+ * 单次 createFromOptions 的最长等待时间。
+ * iOS 上首次编译 wasm 可能要十几到几十秒，同档重试会命中已编译模块，通常 1 秒内返回。
+ */
+const CREATE_TIMEOUT_MS = 60000;
 
 /**
  * iOS / iPadOS 的 WebKit（Safari、微信等内置浏览器同源）在创建 GPU delegate 时
@@ -134,7 +131,7 @@ export class PoseTracker {
       IS_APPLE_MOBILE
         ? [
             { label: "CPU", fileset: simdFileset, delegate: "CPU" },
-            { label: "CPU 兼容档（无 SIMD）", fileset: NOSIMD_FILESET, delegate: "CPU" },
+            { label: "CPU 重试", fileset: simdFileset, delegate: "CPU" },
           ]
         : [
             { label: "GPU", fileset: simdFileset, delegate: POSE_TRACKER_CONFIG.delegate },
@@ -147,7 +144,12 @@ export class PoseTracker {
 
     let lastError: unknown = null;
     for (const attempt of attempts) {
+      const startedAt = performance.now();
       onStage?.(`初始化全身推理引擎（${attempt.label}）…`);
+      const ticker = setInterval(() => {
+        const seconds = Math.round((performance.now() - startedAt) / 1000);
+        onStage?.(`初始化全身推理引擎（${attempt.label}）… ${seconds}s`);
+      }, 1000);
       try {
         const landmarker = await withTimeout(
           this.create(attempt.fileset, attempt.delegate, modelBuffer),
@@ -162,6 +164,8 @@ export class PoseTracker {
       } catch (error) {
         lastError = error;
         console.warn(`[poseTracker] ${attempt.label} 初始化失败，尝试下一档。`, error);
+      } finally {
+        clearInterval(ticker);
       }
     }
 
