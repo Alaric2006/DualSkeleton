@@ -19,6 +19,7 @@ import {
 
 import { POSE_LANDMARK_COUNT, type DetectedPose } from "./poseLandmarks";
 import type { Pt } from "./landmarks";
+import { downloadModel, withTimeout } from "./modelLoader";
 
 /** 实际生效的推理后端；未初始化时为 "none"。 */
 type PoseTrackerBackend = "GPU" | "CPU" | "none";
@@ -38,6 +39,15 @@ const POSE_TRACKER_CONFIG = {
 /** 模型与 wasm 自托管；BASE_URL 支持部署到子路径。 */
 const WASM_DIR = `${import.meta.env.BASE_URL}mediapipe/wasm`;
 const MODEL_URL = `${import.meta.env.BASE_URL}models/pose_landmarker_lite.task`;
+
+/** 无 SIMD 版 wasm：SIMD 版在部分 WebKit 上会卡死在初始化，这里作为兼容档重试。 */
+const NOSIMD_FILESET = {
+  wasmLoaderPath: `${WASM_DIR}/vision_wasm_nosimd_internal.js`,
+  wasmBinaryPath: `${WASM_DIR}/vision_wasm_nosimd_internal.wasm`,
+};
+
+/** 单次 createFromOptions 的最长等待时间；超时即视为该档不可用。 */
+const CREATE_TIMEOUT_MS = 20000;
 
 /**
  * iOS / iPadOS 的 WebKit（Safari、微信等内置浏览器同源）在创建 GPU delegate 时
@@ -78,6 +88,8 @@ export class PoseTracker {
   private backend: PoseTrackerBackend = "none";
   /** 缓存 wasm 运行时，供运行期 CPU 回退时重建模型。 */
   private fileset: WasmFileset | null = null;
+  /** 已下载的模型字节，供运行期 CPU 回退时复用，避免二次下载。 */
+  private modelBuffer: Uint8Array | null = null;
   /** 运行期 GPU 失败只允许触发一次 CPU 回退。 */
   private fallbackStarted = false;
   /** 连续推理失败帧数，仅用于告警抽样。 */
@@ -102,26 +114,58 @@ export class PoseTracker {
 
   /**
    * 初始化 wasm 运行时与姿态模型。
-   * GPU 初始化失败会 console.warn 并回退 CPU；两者都失败时抛错，由调用方决定如何提示。
+   *
+   * 与 handTracker 同构：先显式下载模型（带进度），再按候选后端逐档尝试，
+   * 每档 20 秒超时；iOS/iPadOS 走 CPU → CPU 无 SIMD 兼容档，其他平台 GPU → CPU。
+   *
+   * @param onStage 进度回调，仅供展示状态文字
    */
-  async init(): Promise<void> {
+  async init(onStage?: (stage: string) => void): Promise<void> {
     if (this.landmarker) return;
 
-    this.fileset = await FilesetResolver.forVisionTasks(WASM_DIR);
+    onStage?.("下载全身模型… 0%");
+    const modelBuffer = await downloadModel(MODEL_URL, (loaded, total) => {
+      const percent = total > 0 ? Math.round((loaded / total) * 100) : 0;
+      onStage?.(`下载全身模型… ${percent}%`);
+    });
 
-    const preferred: "GPU" | "CPU" = IS_APPLE_MOBILE ? "CPU" : POSE_TRACKER_CONFIG.delegate;
-    try {
-      this.landmarker = await this.create(preferred);
-      this.backend = preferred;
-    } catch (primaryError) {
-      if (preferred === "CPU") throw primaryError;
-      console.warn(
-        "[poseTracker] GPU delegate 初始化失败，正在回退到 CPU（WASM SIMD）。全身识别仍可用，但帧率会下降。",
-        primaryError,
-      );
-      this.landmarker = await this.create(POSE_TRACKER_CONFIG.fallbackDelegate);
-      this.backend = POSE_TRACKER_CONFIG.fallbackDelegate;
+    const simdFileset = await FilesetResolver.forVisionTasks(WASM_DIR);
+    const attempts: Array<{ label: string; fileset: WasmFileset; delegate: "GPU" | "CPU" }> =
+      IS_APPLE_MOBILE
+        ? [
+            { label: "CPU", fileset: simdFileset, delegate: "CPU" },
+            { label: "CPU 兼容档（无 SIMD）", fileset: NOSIMD_FILESET, delegate: "CPU" },
+          ]
+        : [
+            { label: "GPU", fileset: simdFileset, delegate: POSE_TRACKER_CONFIG.delegate },
+            {
+              label: "CPU",
+              fileset: simdFileset,
+              delegate: POSE_TRACKER_CONFIG.fallbackDelegate,
+            },
+          ];
+
+    let lastError: unknown = null;
+    for (const attempt of attempts) {
+      onStage?.(`初始化全身推理引擎（${attempt.label}）…`);
+      try {
+        const landmarker = await withTimeout(
+          this.create(attempt.fileset, attempt.delegate, modelBuffer),
+          CREATE_TIMEOUT_MS,
+          `${attempt.label} 初始化超时（${CREATE_TIMEOUT_MS / 1000}s）`,
+        );
+        this.fileset = attempt.fileset;
+        this.modelBuffer = modelBuffer;
+        this.landmarker = landmarker;
+        this.backend = attempt.delegate;
+        return;
+      } catch (error) {
+        lastError = error;
+        console.warn(`[poseTracker] ${attempt.label} 初始化失败，尝试下一档。`, error);
+      }
     }
+
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
   /**
@@ -196,6 +240,7 @@ export class PoseTracker {
     this.landmarker = null;
     this.backend = "none";
     this.fileset = null;
+    this.modelBuffer = null;
     this.fallbackStarted = false;
     this.consecutiveFailures = 0;
     this.lastVideoTime = -1;
@@ -218,8 +263,15 @@ export class PoseTracker {
     );
 
     void (async () => {
+      const fileset = this.fileset;
+      const modelBuffer = this.modelBuffer;
+      if (!fileset || !modelBuffer) return;
       try {
-        this.landmarker = await this.create(POSE_TRACKER_CONFIG.fallbackDelegate);
+        this.landmarker = await this.create(
+          fileset,
+          POSE_TRACKER_CONFIG.fallbackDelegate,
+          modelBuffer,
+        );
         this.backend = POSE_TRACKER_CONFIG.fallbackDelegate;
         console.info("[poseTracker] 已切换到 CPU 后端。");
       } catch (fallbackError) {
@@ -229,12 +281,14 @@ export class PoseTracker {
     })();
   }
 
-  private create(delegate: "GPU" | "CPU"): Promise<PoseLandmarker> {
-    const fileset = this.fileset;
-    if (!fileset) return Promise.reject(new Error("wasm 运行时尚未初始化"));
+  private create(
+    fileset: WasmFileset,
+    delegate: "GPU" | "CPU",
+    modelBuffer: Uint8Array,
+  ): Promise<PoseLandmarker> {
     return PoseLandmarker.createFromOptions(fileset, {
       baseOptions: {
-        modelAssetPath: MODEL_URL,
+        modelAssetBuffer: modelBuffer,
         delegate,
       },
       runningMode: POSE_TRACKER_CONFIG.runningMode,

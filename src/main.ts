@@ -92,29 +92,6 @@ async function describeCameraError(error: unknown): Promise<string> {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** 初始化最多等待多久；超时则按失败处理，避免页面无限停在「加载识别模型…」。 */
-const INIT_TIMEOUT_MS = 45000;
-
-/**
- * 给初始化加上超时保护。
- * MediaPipe 在部分 WebKit 设备上既不 resolve 也不 reject，没有超时页面会一直卡住。
- */
-function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
-
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -269,12 +246,14 @@ async function start(): Promise<void> {
   poseOverlay = new PoseOverlay(poseCanvas);
   syncCanvasSizes();
 
-  // 两次 init 串行、各自 try/catch，互不短路；都带超时，避免无限卡在加载态。
+  // 两次 init 串行、各自 try/catch，互不短路。
+  // 进度与超时都由 tracker 内部负责，这里只把阶段文字同步到状态栏。
   let handReady = false;
   let handError: unknown = null;
-  statusEl.textContent = "加载手部模型…";
   try {
-    await withTimeout(handTracker.init(), INIT_TIMEOUT_MS, `手部模型初始化超时（${INIT_TIMEOUT_MS / 1000}s）`);
+    await handTracker.init((stage) => {
+      statusEl.textContent = stage;
+    });
     handReady = true;
   } catch (error) {
     handError = error;
@@ -284,9 +263,10 @@ async function start(): Promise<void> {
 
   let poseReady = false;
   let poseError: unknown = null;
-  statusEl.textContent = "加载全身模型…";
   try {
-    await withTimeout(poseTracker.init(), INIT_TIMEOUT_MS, `全身模型初始化超时（${INIT_TIMEOUT_MS / 1000}s）`);
+    await poseTracker.init((stage) => {
+      statusEl.textContent = stage;
+    });
     poseReady = true;
   } catch (error) {
     poseError = error;

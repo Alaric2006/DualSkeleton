@@ -21,6 +21,7 @@ import {
   type Handedness,
   type Pt,
 } from "./landmarks";
+import { downloadModel, withTimeout } from "./modelLoader";
 
 /** 实际生效的推理后端。GPU 不可用时自动回落 CPU。 */
 export type TrackerBackend = "GPU" | "CPU";
@@ -28,6 +29,15 @@ export type TrackerBackend = "GPU" | "CPU";
 /** 模型与 wasm 全部自托管；BASE_URL 让项目部署到子路径时也能正确解析。 */
 const WASM_DIR = `${import.meta.env.BASE_URL}mediapipe/wasm`;
 const MODEL_URL = `${import.meta.env.BASE_URL}models/hand_landmarker.task`;
+
+/** 无 SIMD 版 wasm：SIMD 版在部分 WebKit 上会卡死在初始化，这里作为兼容档重试。 */
+const NOSIMD_FILESET = {
+  wasmLoaderPath: `${WASM_DIR}/vision_wasm_nosimd_internal.js`,
+  wasmBinaryPath: `${WASM_DIR}/vision_wasm_nosimd_internal.wasm`,
+};
+
+/** 单次 createFromOptions 的最长等待时间；超时即视为该档不可用。 */
+const CREATE_TIMEOUT_MS = 20000;
 
 /**
  * iOS / iPadOS 的 WebKit（Safari、微信等内置浏览器同源）在创建 GPU delegate 时
@@ -57,6 +67,8 @@ export class HandTracker {
   private landmarker: HandLandmarker | null = null;
   private backend: TrackerBackend | null = null;
   private fileset: Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>> | null = null;
+  /** 已下载的模型字节，供运行期 CPU 回退时复用，避免二次下载。 */
+  private modelBuffer: Uint8Array | null = null;
   /** 运行期 GPU 失败只允许触发一次 CPU 回退，避免抖动时反复重建。 */
   private fallbackStarted = false;
 
@@ -90,32 +102,69 @@ export class HandTracker {
 
   /**
    * 初始化 wasm 运行时与模型。
-   * GPU delegate 失败会 console.warn 并自动回退 CPU；两者都失败才抛错，由调用方显示错误提示。
+   *
+   * 步骤拆开是为了在手机上看得出卡在哪一步：
+   *   1) 显式下载模型（带百分比进度）
+   *   2) 依次尝试候选后端，每档 20 秒超时：
+   *      iOS/iPadOS 走 CPU（SIMD）→ CPU（无 SIMD 兼容档）；
+   *      其他平台走 GPU → CPU。
+   * 全部失败才抛错，由调用方显示提示。
+   *
+   * @param onStage 进度回调，仅供展示状态文字，不参与任何逻辑判断
    */
-  async init(): Promise<void> {
-    this.fileset = await FilesetResolver.forVisionTasks(WASM_DIR);
+  async init(onStage?: (stage: string) => void): Promise<void> {
+    onStage?.("下载手部模型… 0%");
+    const modelBuffer = await downloadModel(MODEL_URL, (loaded, total) => {
+      const percent = total > 0 ? Math.round((loaded / total) * 100) : 0;
+      onStage?.(`下载手部模型… ${percent}%`);
+    });
 
-    const preferred: TrackerBackend = IS_APPLE_MOBILE ? "CPU" : "GPU";
-    try {
-      this.landmarker = await this.create(preferred);
-      this.backend = preferred;
-    } catch (primaryError) {
-      if (preferred === "CPU") throw primaryError;
-      console.warn(
-        "[handTracker] GPU delegate 初始化失败，正在回退到 CPU（WASM SIMD）。识别仍可用，但帧率会下降。",
-        primaryError,
-      );
-      this.landmarker = await this.create("CPU");
-      this.backend = "CPU";
+    const simdFileset = await FilesetResolver.forVisionTasks(WASM_DIR);
+    const attempts: Array<{
+      label: string;
+      fileset: Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>;
+      delegate: TrackerBackend;
+    }> = IS_APPLE_MOBILE
+      ? [
+          { label: "CPU", fileset: simdFileset, delegate: "CPU" },
+          { label: "CPU 兼容档（无 SIMD）", fileset: NOSIMD_FILESET, delegate: "CPU" },
+        ]
+      : [
+          { label: "GPU", fileset: simdFileset, delegate: "GPU" },
+          { label: "CPU", fileset: simdFileset, delegate: "CPU" },
+        ];
+
+    let lastError: unknown = null;
+    for (const attempt of attempts) {
+      onStage?.(`初始化手部推理引擎（${attempt.label}）…`);
+      try {
+        const landmarker = await withTimeout(
+          this.create(attempt.fileset, attempt.delegate, modelBuffer),
+          CREATE_TIMEOUT_MS,
+          `${attempt.label} 初始化超时（${CREATE_TIMEOUT_MS / 1000}s）`,
+        );
+        this.fileset = attempt.fileset;
+        this.modelBuffer = modelBuffer;
+        this.landmarker = landmarker;
+        this.backend = attempt.delegate;
+        return;
+      } catch (error) {
+        lastError = error;
+        console.warn(`[handTracker] ${attempt.label} 初始化失败，尝试下一档。`, error);
+      }
     }
+
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
-  private create(delegate: TrackerBackend): Promise<HandLandmarker> {
-    const fileset = this.fileset;
-    if (!fileset) return Promise.reject(new Error("wasm 运行时尚未初始化"));
+  private create(
+    fileset: Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>,
+    delegate: TrackerBackend,
+    modelBuffer: Uint8Array,
+  ): Promise<HandLandmarker> {
     return HandLandmarker.createFromOptions(fileset, {
       baseOptions: {
-        modelAssetPath: MODEL_URL,
+        modelAssetBuffer: modelBuffer,
         delegate,
       },
       runningMode: "VIDEO",
@@ -144,8 +193,11 @@ export class HandTracker {
     );
 
     void (async () => {
+      const fileset = this.fileset;
+      const modelBuffer = this.modelBuffer;
+      if (!fileset || !modelBuffer) return;
       try {
-        this.landmarker = await this.create("CPU");
+        this.landmarker = await this.create(fileset, "CPU", modelBuffer);
         this.backend = "CPU";
         console.info("[handTracker] 已切换到 CPU 后端。");
       } catch (fallbackError) {
