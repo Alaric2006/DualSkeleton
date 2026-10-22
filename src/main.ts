@@ -92,6 +92,33 @@ async function describeCameraError(error: unknown): Promise<string> {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** 初始化最多等待多久；超时则按失败处理，避免页面无限停在「加载识别模型…」。 */
+const INIT_TIMEOUT_MS = 45000;
+
+/**
+ * 给初始化加上超时保护。
+ * MediaPipe 在部分 WebKit 设备上既不 resolve 也不 reject，没有超时页面会一直卡住。
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function showError(title: string, detail: string): void {
   running = false;
   statusEl.textContent = "启动失败";
@@ -241,23 +268,28 @@ async function start(): Promise<void> {
   handOverlay = new Overlay(handCanvas);
   poseOverlay = new PoseOverlay(poseCanvas);
   syncCanvasSizes();
-  statusEl.textContent = "加载识别模型…";
 
-  // 两次 init 串行、各自 try/catch，互不短路。
+  // 两次 init 串行、各自 try/catch，互不短路；都带超时，避免无限卡在加载态。
   let handReady = false;
+  let handError: unknown = null;
+  statusEl.textContent = "加载手部模型…";
   try {
-    await handTracker.init();
+    await withTimeout(handTracker.init(), INIT_TIMEOUT_MS, `手部模型初始化超时（${INIT_TIMEOUT_MS / 1000}s）`);
     handReady = true;
   } catch (error) {
+    handError = error;
     console.error("[main] 手部识别模型初始化失败", error);
     // 依赖：HandTracker.detect() 在未初始化时返回 []（不抛错），主循环可以继续。
   }
 
   let poseReady = false;
+  let poseError: unknown = null;
+  statusEl.textContent = "加载全身模型…";
   try {
-    await poseTracker.init();
+    await withTimeout(poseTracker.init(), INIT_TIMEOUT_MS, `全身模型初始化超时（${INIT_TIMEOUT_MS / 1000}s）`);
     poseReady = true;
   } catch (error) {
+    poseError = error;
     console.error("[main] 全身识别模型初始化失败", error);
     // 彻底关闭姿态链路：scheduler 不再推理、不再 emit pose:raw / hand:relation。
     scheduler.disablePose();
@@ -267,15 +299,16 @@ async function start(): Promise<void> {
   if (!handReady && !poseReady) {
     showError(
       "识别模型初始化失败",
-      "手部与全身模型均未能加载。请确认 public/models 与 public/mediapipe/wasm 下的文件完整，且通过 npm run dev 访问。",
+      `手部：${describeError(handError)}；全身：${describeError(poseError)}。` +
+        "浏览器控制台（远程调试）可查看完整错误。",
     );
     return;
   }
 
   if (!handReady) {
-    showNotice("手部识别不可用：摄像头画面与全身骨架仍可用。");
+    showNotice(`手部识别不可用：${describeError(handError)}。摄像头画面与全身骨架仍可用。`);
   } else if (!poseReady) {
-    showNotice("全身识别不可用，手部功能不受影响。");
+    showNotice(`全身识别不可用：${describeError(poseError)}。手部功能不受影响。`);
   }
 
   console.info(

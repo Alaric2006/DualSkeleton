@@ -39,6 +39,15 @@ const POSE_TRACKER_CONFIG = {
 const WASM_DIR = `${import.meta.env.BASE_URL}mediapipe/wasm`;
 const MODEL_URL = `${import.meta.env.BASE_URL}models/pose_landmarker_lite.task`;
 
+/**
+ * iOS / iPadOS 的 WebKit（Safari、微信等内置浏览器同源）在创建 GPU delegate 时
+ * 可能既不返回也不抛错，表现为页面一直停在「加载识别模型…」。
+ * 这类设备直接使用 CPU 后端；其他平台仍然 GPU 优先。
+ */
+const IS_APPLE_MOBILE =
+  /iP(hone|ad|od)/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
 type WasmFileset = Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>;
 
 function toPt(p: { x: number; y: number; z: number }): Pt {
@@ -100,13 +109,15 @@ export class PoseTracker {
 
     this.fileset = await FilesetResolver.forVisionTasks(WASM_DIR);
 
+    const preferred: "GPU" | "CPU" = IS_APPLE_MOBILE ? "CPU" : POSE_TRACKER_CONFIG.delegate;
     try {
-      this.landmarker = await this.create(POSE_TRACKER_CONFIG.delegate);
-      this.backend = POSE_TRACKER_CONFIG.delegate;
-    } catch (gpuError) {
+      this.landmarker = await this.create(preferred);
+      this.backend = preferred;
+    } catch (primaryError) {
+      if (preferred === "CPU") throw primaryError;
       console.warn(
         "[poseTracker] GPU delegate 初始化失败，正在回退到 CPU（WASM SIMD）。全身识别仍可用，但帧率会下降。",
-        gpuError,
+        primaryError,
       );
       this.landmarker = await this.create(POSE_TRACKER_CONFIG.fallbackDelegate);
       this.backend = POSE_TRACKER_CONFIG.fallbackDelegate;

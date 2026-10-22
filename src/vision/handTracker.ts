@@ -29,6 +29,15 @@ export type TrackerBackend = "GPU" | "CPU";
 const WASM_DIR = `${import.meta.env.BASE_URL}mediapipe/wasm`;
 const MODEL_URL = `${import.meta.env.BASE_URL}models/hand_landmarker.task`;
 
+/**
+ * iOS / iPadOS 的 WebKit（Safari、微信等内置浏览器同源）在创建 GPU delegate 时
+ * 可能既不返回也不抛错，表现为页面一直停在「加载识别模型…」。
+ * 这类设备直接使用 CPU 后端；其他平台仍然 GPU 优先。
+ */
+const IS_APPLE_MOBILE =
+  /iP(hone|ad|od)/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
 /** 连续多少帧推理失败后判定为不可用并上报（30fps 下约 1 秒）。 */
 const FATAL_FAILURE_FRAMES = 30;
 /** 运行期告警的抽样间隔，避免每帧刷屏。 */
@@ -86,13 +95,15 @@ export class HandTracker {
   async init(): Promise<void> {
     this.fileset = await FilesetResolver.forVisionTasks(WASM_DIR);
 
+    const preferred: TrackerBackend = IS_APPLE_MOBILE ? "CPU" : "GPU";
     try {
-      this.landmarker = await this.create("GPU");
-      this.backend = "GPU";
-    } catch (gpuError) {
+      this.landmarker = await this.create(preferred);
+      this.backend = preferred;
+    } catch (primaryError) {
+      if (preferred === "CPU") throw primaryError;
       console.warn(
         "[handTracker] GPU delegate 初始化失败，正在回退到 CPU（WASM SIMD）。识别仍可用，但帧率会下降。",
-        gpuError,
+        primaryError,
       );
       this.landmarker = await this.create("CPU");
       this.backend = "CPU";
