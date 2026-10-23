@@ -91,11 +91,16 @@
        * 由它撑出 .stage 的真实宽高比；两块 canvas 绝对定位铺满同一块区域，
        * 因为排在 video 之后，绘制顺序天然位于 video 之上，无需 z-index。
        */
+      /*
+       * 自拍镜像：摄像头画面水平翻转。两块 canvas 不翻转，
+       * 由 overlay/poseOverlay 在绘制时把 x 取 1-x，二者仍然逐像素对齐。
+       */
       .stage > video {
         display: block;
         width: 100%;
         height: auto;
         background: #000;
+        transform: scaleX(-1);
       }
 
       /*

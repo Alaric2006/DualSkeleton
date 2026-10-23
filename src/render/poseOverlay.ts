@@ -84,6 +84,9 @@ export class PoseOverlay {
 
     ctx.clearRect(0, 0, width, height);
 
+    /** 自拍镜像：把归一化 x 映射到翻转后的画布像素坐标，与镜像后的 <video> 对齐。 */
+    const mirrorX = (normalizedX: number): number => (1 - normalizedX) * width;
+
     // 骨架连线（35 条）。
     ctx.strokeStyle = color;
     ctx.lineWidth = lineWidth;
@@ -92,8 +95,8 @@ export class PoseOverlay {
     for (const [from, to] of POSE_CONNECTIONS) {
       const a = posePt(pose.lm, from);
       const b2 = posePt(pose.lm, to);
-      ctx.moveTo(a.x * width, a.y * height);
-      ctx.lineTo(b2.x * width, b2.y * height);
+      ctx.moveTo(mirrorX(a.x), a.y * height);
+      ctx.lineTo(mirrorX(b2.x), b2.y * height);
     }
     ctx.stroke();
 
@@ -101,7 +104,7 @@ export class PoseOverlay {
     ctx.fillStyle = color;
     for (const point of pose.lm) {
       ctx.beginPath();
-      ctx.arc(point.x * width, point.y * height, pointRadius, 0, Math.PI * 2);
+      ctx.arc(mirrorX(point.x), point.y * height, pointRadius, 0, Math.PI * 2);
       ctx.fill();
     }
   }

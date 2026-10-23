@@ -11,8 +11,9 @@
  *
  * 镜像约定（与 vision/landmarks.ts 的 HANDEDNESS_SWAP 配套）：
  *   - 推理使用的是未镜像的原始帧，所以 handedness 是真实解剖手；
- *   - <video> 按摄像头原始画面显示，canvas 也用同一坐标系逐像素对齐，**不做任何水平翻转**；
- *   - 若将来想要自拍镜像效果，必须同时对 #video 与 canvas 应用镜像。
+ *   - <video> 由 CSS `transform: scaleX(-1)` 做自拍镜像，本层不做 CSS 翻转，
+ *     而是在绘制时把 x 取 1-x，使骨架、标签与镜像后的画面继续逐像素对齐；
+ *   - 标签文字仍按正常方向绘制，不会出现镜像反字。
  */
 
 import {
@@ -54,12 +55,14 @@ export class Overlay {
     const ctx = this.ctx;
     const lineWidth = Math.max(2, width / 420);
     const dotRadius = Math.max(3, width / 320);
+    /** 自拍镜像：把归一化 x 映射到翻转后的画布像素坐标。 */
+    const mirrorX = (normalizedX: number): number => (1 - normalizedX) * width;
 
     for (const hand of hands) {
       if (hand.lm.length !== LANDMARK_COUNT) continue;
       const color = HAND_COLORS[hand.handedness];
 
-      // —— 骨架与关键点：与 <video> 同一坐标系，逐像素对齐 ——
+      // —— 骨架与关键点：与镜像后的 <video> 逐像素对齐 ——
       ctx.save();
 
       ctx.strokeStyle = color;
@@ -69,15 +72,15 @@ export class Overlay {
       for (const [from, to] of HAND_CONNECTIONS) {
         const a = pt(hand.lm, from);
         const b = pt(hand.lm, to);
-        ctx.moveTo(a.x * width, a.y * height);
-        ctx.lineTo(b.x * width, b.y * height);
+        ctx.moveTo(mirrorX(a.x), a.y * height);
+        ctx.lineTo(mirrorX(b.x), b.y * height);
       }
       ctx.stroke();
 
       ctx.fillStyle = color;
       for (const p of hand.lm) {
         ctx.beginPath();
-        ctx.arc(p.x * width, p.y * height, dotRadius, 0, Math.PI * 2);
+        ctx.arc(mirrorX(p.x), p.y * height, dotRadius, 0, Math.PI * 2);
         ctx.fill();
       }
       ctx.restore();
@@ -85,7 +88,7 @@ export class Overlay {
       // —— 文字标签：与骨架同一坐标系 ——
       const label = labels.get(hand.handedness) ?? "—";
       const wrist = pt(hand.lm, 0);
-      const textX = wrist.x * width;
+      const textX = mirrorX(wrist.x);
       const textY = Math.min(height - 12, Math.max(24, wrist.y * height + 56));
       this.drawLabel(ctx, `${hand.handedness} · ${label}`, textX, textY, color, width);
     }
